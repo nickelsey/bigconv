@@ -1,0 +1,36 @@
+[workspace]
+channels = ["conda-forge"]
+name = "bigconv"
+version = "0.1.0"
+description = "Development environment for distributed networks"
+license = "MIT"
+platforms = ["linux-aarch64", "linux-64", "osx-arm64"]
+readme = "README.md"
+
+[dependencies]
+numpy = "*"
+
+[feature.gpu.system-requirements]
+cuda = "13"
+
+[feature.gpu.target.linux-aarch64.dependencies]
+pytorch-gpu = ">=2.10,<3"
+cuda-toolkit = ">=13.0"
+triton = ">=3.6.0,<4"
+
+[feature.gpu.target.linux-64.dependencies]
+pytorch-gpu = ">=2.10,<3"
+cuda-toolkit = ">=13.0"
+triton = ">=3.6.0,<4"
+
+[feature.gpu.pypi-dependencies]
+helion = ">=0.3.2, <0.4"
+packaging = ">=26.0, <27"
+
+[feature.cpu.dependencies]
+pytorch-cpu = ">=2.10,<3"
+
+[environments]
+default = ["gpu"]
+cpu = ["cpu"]
+
