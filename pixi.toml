@@ -6,9 +6,21 @@ description = "Development environment for distributed networks"
 license = "MIT"
 platforms = ["linux-aarch64", "linux-64", "osx-arm64"]
 readme = "README.md"
+preview = [ "pixi-build" ]
+
+[package]
+name = "bigconv"
+version = "0.1.0"
+
+[package.build] 
+backend = { name = "pixi-build-python", version = "0.*" }
+
+[package.host-dependencies] 
+hatchling = "*"
 
 [dependencies]
 numpy = "*"
+bigconv = { path = "." }
 
 [feature.gpu.system-requirements]
 cuda = "13"
@@ -30,7 +42,13 @@ packaging = ">=26.0, <27"
 [feature.cpu.dependencies]
 pytorch-cpu = ">=2.10,<3"
 
+[feature.dev.dependencies]
+pytest = "*"
+ruff = "*"
+
 [environments]
 default = ["gpu"]
 cpu = ["cpu"]
+dev = ["gpu", "dev"]
+dev-cpu = ["cpu", "dev"]
 
