@@ -2,7 +2,7 @@
 channels = ["conda-forge"]
 name = "bigconv"
 version = "0.1.0"
-description = "Development environment for distributed networks"
+description = "Development environment for bigconv distributed model building blocks"
 license = "MIT"
 platforms = ["linux-aarch64", "linux-64", "osx-arm64"]
 readme = "README.md"
@@ -19,9 +19,14 @@ backend = { name = "pixi-build-python", version = "0.*" }
 hatchling = "*"
 
 [dependencies]
+# Keep the interpreter constraint aligned with pyproject.toml's requires-python.
+python = ">=3.10"
 numpy = "*"
 bigconv = { path = "." }
 
+# PyTorch is intentionally selected by feature so CPU and GPU environments can
+# use the appropriate conda-forge builds without leaking PyPI torch semantics
+# into package metadata.
 [feature.gpu.system-requirements]
 cuda = "13"
 
@@ -46,9 +51,11 @@ pytorch-cpu = ">=2.10,<3"
 pytest = "*"
 ruff = "*"
 
+[feature.dev.pypi-dependencies]
+pyrefly = "*"
+
 [environments]
 default = ["gpu"]
 cpu = ["cpu"]
 dev = ["gpu", "dev"]
 dev-cpu = ["cpu", "dev"]
-
