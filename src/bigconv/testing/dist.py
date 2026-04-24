@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import traceback
 from contextlib import closing
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -45,7 +47,11 @@ class WorkerError:
 
 
 class DistributedTestError(RuntimeError):
-    """Raised in the parent when one or more workers failed."""
+    """Error raised in the parent when one or more workers fail.
+
+    Args:
+        errors: Worker errors collected from child processes.
+    """
 
     def __init__(self, errors: list[WorkerError]):
         self.errors = errors
@@ -58,12 +64,25 @@ def _worker_entry(
     world_size: int,
     master_port: int,
     result_queue: mp.Queue,
-    done_event: mp.Event,
+    done_event: Any,
+    done_timeout: float,
     fn: Callable[..., Any],
     args: tuple,
     kwargs: dict,
 ) -> None:
-    """Runs inside each spawned process."""
+    """Run one distributed test worker.
+
+    Args:
+        rank: Rank assigned to this worker.
+        world_size: Number of worker processes in the group.
+        master_port: Localhost port used for process-group initialization.
+        result_queue: Queue used to return success or failure payloads.
+        done_event: Event set by the parent after result deserialization.
+        done_timeout: Maximum seconds to keep worker tensor FD servers alive.
+        fn: Per-rank function to execute.
+        args: Positional arguments forwarded to ``fn``.
+        kwargs: Keyword arguments forwarded to ``fn``.
+    """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
@@ -99,7 +118,7 @@ def _worker_entry(
     # results from the queue.  torch.multiprocessing shares tensor storage via
     # a per-process FD server; if we exit before the parent reads our tensors,
     # the server socket vanishes and deserialization fails with EOFError.
-    done_event.wait(timeout=60)
+    done_event.wait(timeout=done_timeout)
 
 
 def _to_cpu(obj: Any) -> Any:
@@ -120,9 +139,7 @@ def run_distributed(
     timeout: float = 60.0,
     **kwargs,
 ) -> list[Any]:
-    """
-    Launch ``fn`` on ``world_size`` worker processes and return a list of
-    results indexed by rank.
+    """Launch a function across distributed worker processes.
 
     ``fn`` must have the signature ``fn(rank, world_size, *args, **kwargs)``
     and is responsible only for its distributed logic — process group
@@ -137,32 +154,30 @@ def run_distributed(
     Test functions that want GPU tensors can simply create them on ``"cuda"``
     — gloo will handle the collectives.
 
-    Parameters
-    ----------
-    fn : callable
-        The per-rank function to run.
-    world_size : int
-        Number of worker processes to spawn.
-    timeout : float
-        Seconds to wait for all workers to finish before giving up.
-    *args, **kwargs
-        Forwarded to ``fn``.
+    Args:
+        fn: Per-rank function to run.
+        world_size: Number of worker processes to spawn.
+        *args: Positional arguments forwarded to ``fn``.
+        timeout: Seconds to wait for all workers to finish before giving up.
+        **kwargs: Keyword arguments forwarded to ``fn``.
 
-    Returns
-    -------
-    list
+    Returns:
         Results in rank order. Tensors are returned on CPU.
+
+    Raises:
+        TimeoutError: If one or more workers do not report before ``timeout``.
+        DistributedTestError: If one or more workers fail.
     """
     master_port = _find_free_port()
 
     # 'spawn' is required for CUDA and safest for gloo too.
     ctx = mp.get_context("spawn")
     result_queue: mp.Queue = ctx.Queue()
-    # Signalled after the parent has finished deserializing all results,
+    # signalled after the parent has finished deserializing all results,
     # so workers keep their FD servers alive until then.
     done_event = ctx.Event()
 
-    procs: list[mp.Process] = []
+    procs: list[Any] = []
     for rank in range(world_size):
         p = ctx.Process(
             target=_worker_entry,
@@ -172,6 +187,7 @@ def run_distributed(
                 master_port,
                 result_queue,
                 done_event,
+                timeout,
                 fn,
                 args,
                 kwargs,
@@ -198,7 +214,7 @@ def run_distributed(
         else:
             errors.append(payload)
 
-    # All results deserialized — workers can now exit safely.
+    # all results deserialized — workers can now exit safely
     done_event.set()
     if timed_out:
         for p in procs:
@@ -210,7 +226,7 @@ def run_distributed(
             p.terminate()
             p.join(timeout=5.0)
 
-    # Surface any non-zero exits that didn't report through the queue
+    # surface any non-zero exits that didn't report through the queue
     # (e.g. segfault, OOM-kill).
     for rank, p in enumerate(procs):
         if (
@@ -234,11 +250,145 @@ def run_distributed(
             if r not in results and not any(e.rank == r for e in errors)
         ]
         raise TimeoutError(
-            f"Distributed test timed out after {timeout}s; "
-            f"ranks that never reported: {missing}"
+            f"Distributed test timed out after {timeout}s; ranks that never reported: {missing}"
         )
 
     if errors:
         raise DistributedTestError(sorted(errors, key=lambda e: e.rank))
 
     return [results[r] for r in range(world_size)]
+
+
+def distributed(
+    world_size: int | Sequence[int],
+    device: str | Sequence[str] | None = None,
+    timeout: float = 60.0,
+) -> Callable:
+    """Pytest decorator that runs the decorated function on each rank of a spawned group.
+
+    The decorated test becomes a per-rank worker with signature
+    ``(rank, world_size[, device])``. Assertion failures inside any rank are
+    surfaced as a ``DistributedTestError`` with the rank's traceback.
+
+    Args:
+        world_size: Single int or a sequence. A sequence parametrizes the test
+            across world sizes.
+        device: Optional device name or sequence of device names. ``"cuda"``
+            entries auto-skip when CUDA is unavailable. When provided, the
+            worker receives ``device`` as a keyword argument.
+        timeout: Per-test wall-clock timeout forwarded to ``run_distributed``.
+
+    Returns:
+        Decorator that wraps a per-rank test function.
+    """
+    if isinstance(world_size, int):
+        parametrize_ws = False
+        ws_list = [world_size]
+    else:
+        parametrize_ws = True
+        ws_list = list(world_size)
+
+    if device is None:
+        dev_params = None
+    else:
+        dev_list = list(device) if isinstance(device, (list, tuple)) else [device]
+        dev_params = [
+            pytest.param(
+                d,
+                marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+            )
+            if d == "cuda"
+            else d
+            for d in dev_list
+        ]
+
+    def deco(fn: Callable) -> Callable:
+        # Spawn pickles fn by (module, qualname). After decoration, the module
+        # name binds to the wrapper, so stash the original under a mangled
+        # attribute so pickle can still find it in the child.
+        original_name = fn.__name__
+        mod = sys.modules.get(fn.__module__)
+        if mod is not None:
+            stash_name = f"_distributed_inner__{fn.__qualname__.replace('.', '_')}"
+            setattr(mod, stash_name, fn)
+            fn.__qualname__ = stash_name
+            fn.__name__ = stash_name
+
+        if dev_params is None:
+            if parametrize_ws:
+
+                def wrapper(world_size):
+                    run_distributed(fn, world_size, timeout=timeout)
+
+                wrapper = pytest.mark.parametrize("world_size", ws_list)(wrapper)
+            else:
+                ws = ws_list[0]
+
+                def wrapper():
+                    run_distributed(fn, ws, timeout=timeout)
+        else:
+            if parametrize_ws:
+
+                def wrapper(world_size, device):
+                    run_distributed(fn, world_size, timeout=timeout, device=device)
+
+                wrapper = pytest.mark.parametrize("device", dev_params)(wrapper)
+                wrapper = pytest.mark.parametrize("world_size", ws_list)(wrapper)
+            else:
+                ws = ws_list[0]
+
+                def wrapper(device):
+                    run_distributed(fn, ws, timeout=timeout, device=device)
+
+                wrapper = pytest.mark.parametrize("device", dev_params)(wrapper)
+
+        wrapper.__name__ = original_name
+        wrapper.__qualname__ = original_name
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+
+    return deco
+
+
+def gather_per_rank(
+    results: list[dict[str, Any]],
+    key: str,
+    dim: int = 0,
+) -> torch.Tensor:
+    """Concatenate per-rank tensors.
+
+    Args:
+        results: Per-rank result dictionaries.
+        key: Key to read from each rank's result dictionary.
+        dim: Dimension along which tensors are concatenated.
+
+    Returns:
+        Concatenated tensor.
+    """
+    return torch.cat([r[key] for r in results], dim=dim)
+
+
+def assert_close_per_rank(
+    results: list[Any],
+    expected: list[Any],
+    key: str | None = None,
+    **kwargs: Any,
+) -> None:
+    """Assert each rank's result matches the corresponding entry of ``expected``.
+
+    Args:
+        results: Per-rank result objects.
+        expected: Per-rank expected objects.
+        key: Optional key to read from each rank's result before comparison.
+        **kwargs: Extra keyword arguments forwarded to
+            ``torch.testing.assert_close``.
+    """
+    for r, got in enumerate(results):
+        if key is not None:
+            got = got[key]
+        torch.testing.assert_close(
+            got,
+            expected[r],
+            msg=lambda m, r=r: f"rank {r}: {m}",
+            **kwargs,
+        )
