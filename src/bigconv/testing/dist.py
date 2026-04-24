@@ -12,13 +12,14 @@ which is the common case in development and CI environments.
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import sys
 import traceback
 from contextlib import closing
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, TypeGuard, cast
 
 import pytest
 import torch
@@ -260,7 +261,9 @@ def run_distributed(
 
 
 def distributed(
-    world_size: int | Sequence[int],
+    world_size: int | Sequence[int] | None = None,
+    *,
+    mesh_shape: tuple[int, ...] | Sequence[tuple[int, ...]] | None = None,
     device: str | Sequence[str] | None = None,
     timeout: float = 60.0,
 ) -> Callable:
@@ -272,7 +275,11 @@ def distributed(
 
     Args:
         world_size: Single int or a sequence. A sequence parametrizes the test
-            across world sizes.
+            across world sizes. Pass exactly one of ``world_size`` or
+            ``mesh_shape``.
+        mesh_shape: Single mesh shape or a sequence of mesh shapes. When
+            provided, ``world_size`` is derived from ``math.prod(mesh_shape)``
+            and ``mesh_shape`` is forwarded to the worker as a keyword argument.
         device: Optional device name or sequence of device names. ``"cuda"``
             entries auto-skip when CUDA is unavailable. When provided, the
             worker receives ``device`` as a keyword argument.
@@ -280,13 +287,45 @@ def distributed(
 
     Returns:
         Decorator that wraps a per-rank test function.
+
+    Raises:
+        ValueError: If both or neither of ``world_size`` and ``mesh_shape`` are
+            provided, or if any provided size is invalid.
     """
-    if isinstance(world_size, int):
-        parametrize_ws = False
-        ws_list = [world_size]
+    if (world_size is None) == (mesh_shape is None):
+        raise ValueError("pass exactly one of world_size or mesh_shape")
+
+    if mesh_shape is None:
+        assert world_size is not None
+        if isinstance(world_size, int):
+            parametrize_ws = False
+            ws_list = [world_size]
+        else:
+            parametrize_ws = True
+            ws_list = list(world_size)
+
+        for ws in ws_list:
+            if not isinstance(ws, int) or ws <= 0:
+                raise ValueError(f"world_size values must be positive ints, got {ws!r}")
+        mesh_cases = None
     else:
-        parametrize_ws = True
-        ws_list = list(world_size)
+        if _is_mesh_shape(mesh_shape):
+            mesh_shapes = [mesh_shape]
+            parametrize_ws = False
+        else:
+            mesh_shapes = list(cast(Sequence[tuple[int, ...]], mesh_shape))
+            parametrize_ws = True
+
+        mesh_cases = []
+        for shape in mesh_shapes:
+            if not _is_mesh_shape(shape):
+                raise ValueError(
+                    f"mesh_shape values must be non-empty tuples of ints, got {shape!r}"
+                )
+            if any(dim <= 0 for dim in shape):
+                raise ValueError(f"mesh_shape dimensions must be positive, got {shape!r}")
+            mesh_cases.append((math.prod(shape), shape))
+        ws_list = [ws for ws, _shape in mesh_cases]
 
     if device is None:
         dev_params = None
@@ -315,7 +354,18 @@ def distributed(
             fn.__name__ = stash_name
 
         if dev_params is None:
-            if parametrize_ws:
+            if mesh_cases is not None and parametrize_ws:
+
+                def wrapper(world_size, mesh_shape):
+                    run_distributed(fn, world_size, timeout=timeout, mesh_shape=mesh_shape)
+
+                wrapper = pytest.mark.parametrize(("world_size", "mesh_shape"), mesh_cases)(wrapper)
+            elif mesh_cases is not None:
+                ws, shape = mesh_cases[0]
+
+                def wrapper():
+                    run_distributed(fn, ws, timeout=timeout, mesh_shape=shape)
+            elif parametrize_ws:
 
                 def wrapper(world_size):
                     run_distributed(fn, world_size, timeout=timeout)
@@ -327,7 +377,25 @@ def distributed(
                 def wrapper():
                     run_distributed(fn, ws, timeout=timeout)
         else:
-            if parametrize_ws:
+            if mesh_cases is not None and parametrize_ws:
+
+                def wrapper(world_size, mesh_shape, device):
+                    run_distributed(
+                        fn,
+                        world_size,
+                        timeout=timeout,
+                        mesh_shape=mesh_shape,
+                        device=device,
+                    )
+
+                wrapper = pytest.mark.parametrize("device", dev_params)(wrapper)
+                wrapper = pytest.mark.parametrize(("world_size", "mesh_shape"), mesh_cases)(wrapper)
+            elif mesh_cases is not None:
+                ws, shape = mesh_cases[0]
+
+                def wrapper(device):
+                    run_distributed(fn, ws, timeout=timeout, mesh_shape=shape, device=device)
+            elif parametrize_ws:
 
                 def wrapper(world_size, device):
                     run_distributed(fn, world_size, timeout=timeout, device=device)
@@ -348,6 +416,10 @@ def distributed(
         return wrapper
 
     return deco
+
+
+def _is_mesh_shape(value: object) -> TypeGuard[tuple[int, ...]]:
+    return isinstance(value, tuple) and len(value) > 0 and all(isinstance(v, int) for v in value)
 
 
 def gather_per_rank(

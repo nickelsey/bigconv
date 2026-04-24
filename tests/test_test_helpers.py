@@ -35,6 +35,45 @@ def test_all_gather(rank, world_size):
         assert torch.equal(got, exp)
 
 
+@distributed(world_size=[1, 2])
+def test_world_size_list_parametrizes(rank, world_size):
+    t = torch.tensor([float(rank + 1)])
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    expected = float(world_size * (world_size + 1) // 2)
+    assert torch.equal(t, torch.tensor([expected]))
+
+
+@distributed(mesh_shape=(2, 2))
+def test_mesh_shape_derives_world_size(rank, world_size, mesh_shape):
+    assert mesh_shape == (2, 2)
+    assert world_size == 4
+    t = torch.tensor([1.0])
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    assert torch.equal(t, torch.tensor([4.0]))
+
+
+@distributed(mesh_shape=[(1,), (2,)])
+def test_mesh_shape_list_parametrizes(rank, world_size, mesh_shape):
+    assert world_size == mesh_shape[0]
+    t = torch.tensor([1.0])
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    assert torch.equal(t, torch.tensor([float(world_size)]))
+
+
+def test_distributed_rejects_invalid_topology_args():
+    with pytest.raises(ValueError, match="exactly one"):
+        distributed()
+
+    with pytest.raises(ValueError, match="exactly one"):
+        distributed(world_size=2, mesh_shape=(2,))
+
+    with pytest.raises(ValueError, match="world_size values must be positive"):
+        distributed(world_size=[1, 0])
+
+    with pytest.raises(ValueError, match="mesh_shape dimensions must be positive"):
+        distributed(mesh_shape=(2, 0))
+
+
 @distributed(world_size=2)
 def test_broadcast(rank, world_size):
     if rank == 0:
