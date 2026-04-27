@@ -80,10 +80,10 @@ def _reference_scatter(all_feat, all_dest, all_xyz, world_size):
         mask = all_dest == dest_r
         f = all_feat[mask]
         c = all_xyz[mask]
-        grid = torch.zeros(X_LOCAL * Y * Z, C)
+        grid = torch.zeros(C, X_LOCAL * Y * Z)
         lin = ((c[:, 0] * Y) + c[:, 1]) * Z + c[:, 2]
-        grid.index_add_(0, lin, f)
-        grids.append(grid.view(X_LOCAL, Y, Z, C))
+        grid.index_add_(1, lin, f.transpose(0, 1))
+        grids.append(grid.view(C, X_LOCAL, Y, Z))
     return grids
 
 
@@ -320,5 +320,5 @@ def test_scatter_validation_accepts_empty_inputs(rank, world_size):
     xyz = torch.empty((0, 3), dtype=torch.int64)
 
     voxel = encoder_scatter_to_voxel(feat, dest_rank, xyz, 2, 2, 2)
-    assert voxel.shape == (2, 2, 2, 3)
+    assert voxel.shape == (3, 2, 2, 2)
     assert torch.all(voxel == 0)

@@ -58,7 +58,7 @@ def _validate_conv_args(
     so early validation failures do not hang other ranks.
 
     Args:
-        x: Local channels-last input tensor with shape ``(X_local, Y, Z, C_in)``.
+        x: Local channels-first input tensor with shape ``(C_in, X_local, Y, Z)``.
         weight: Convolution weight with shape ``(C_out, C_in, K_x, K_y, K_z)``.
         bias: Optional bias tensor with shape ``(C_out,)``.
         stride: Per-axis convolution stride.
@@ -73,9 +73,9 @@ def _validate_conv_args(
 
     if x.ndim != 4:
         raise ValueError(
-            f"x must be 4D (X_local, Y, Z, C_in), got {x.ndim}D with shape {tuple(x.shape)}"
+            f"x must be 4D (C_in, X_local, Y, Z), got {x.ndim}D with shape {tuple(x.shape)}"
         )
-    X_local, _Y, _Z, C_in = x.shape
+    C_in, X_local, _Y, _Z = x.shape
 
     if weight.ndim != 5:
         raise ValueError(
@@ -183,7 +183,7 @@ def _reference_conv3d(
     """Compute the single-process reference convolution used by tests.
 
     Args:
-        x: Channels-last input tensor with shape ``(X, Y, Z, C_in)``.
+        x: Channels-first input tensor with shape ``(C_in, X, Y, Z)``.
         weight: Weight tensor with shape ``(C_out, C_in, K_x, K_y, K_z)``.
         bias: Optional bias tensor with shape ``(C_out,)``.
         stride: Scalar or per-axis convolution stride.
@@ -191,17 +191,16 @@ def _reference_conv3d(
         padding_mode: Padding mode to use.
 
     Returns:
-        Channels-last output tensor. The validator runs with ``mesh=None``.
+        Channels-first output tensor. The validator runs with ``mesh=None``.
     """
     stride_t = _normalize_tuple(stride, "stride")
     padding_t = _normalize_tuple(padding, "padding")
     _validate_conv_args(x, weight, bias, stride_t, padding_t, padding_mode, mesh=None)
 
-    x_nchw = x.unsqueeze(0).permute(0, 4, 1, 2, 3)
-    w_cl = weight.to(memory_format=torch.channels_last_3d)
+    x_ncdhw = x.unsqueeze(0)
 
     if padding_mode == "zeros":
-        out_nchw = F.conv3d(x_nchw, w_cl, bias, stride=stride_t, padding=padding_t)
+        out_ncdhw = F.conv3d(x_ncdhw, weight, bias, stride=stride_t, padding=padding_t)
     else:
         pad_amounts = [
             padding_t[2],
@@ -211,10 +210,10 @@ def _reference_conv3d(
             padding_t[0],
             padding_t[0],
         ]
-        x_padded = F.pad(x_nchw, pad_amounts, mode=padding_mode)
-        out_nchw = F.conv3d(x_padded, w_cl, bias, stride=stride_t, padding=0)
+        x_padded = F.pad(x_ncdhw, pad_amounts, mode=padding_mode)
+        out_ncdhw = F.conv3d(x_padded, weight, bias, stride=stride_t, padding=0)
 
-    return out_nchw.squeeze(0).permute(1, 2, 3, 0)
+    return out_ncdhw.squeeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -226,11 +225,11 @@ def _apply_left_edge_padding(
     out: torch.Tensor, x: torch.Tensor, halo: int, padding_mode: str
 ) -> None:
     if padding_mode == "zeros":
-        out[:halo].zero_()
+        out[:, :halo].zero_()
     elif padding_mode == "replicate":
-        out[:halo] = x[0:1]
+        out[:, :halo] = x[:, 0:1]
     elif padding_mode == "reflect":
-        out[:halo] = x[1 : halo + 1].flip(0)
+        out[:, :halo] = x[:, 1 : halo + 1].flip(1)
     else:  # pragma: no cover
         raise ValueError(f"unknown padding_mode {padding_mode!r}")
 
@@ -238,13 +237,13 @@ def _apply_left_edge_padding(
 def _apply_right_edge_padding(
     out: torch.Tensor, x: torch.Tensor, halo: int, padding_mode: str
 ) -> None:
-    X_local = x.shape[0]
+    X_local = x.shape[1]
     if padding_mode == "zeros":
-        out[-halo:].zero_()
+        out[:, -halo:].zero_()
     elif padding_mode == "replicate":
-        out[-halo:] = x[-1:]
+        out[:, -halo:] = x[:, -1:]
     elif padding_mode == "reflect":
-        out[-halo:] = x[X_local - halo - 1 : X_local - 1].flip(0)
+        out[:, -halo:] = x[:, X_local - halo - 1 : X_local - 1].flip(1)
     else:  # pragma: no cover
         raise ValueError(f"unknown padding_mode {padding_mode!r}")
 
@@ -254,22 +253,22 @@ def _apply_left_edge_padding_backward(
 ) -> None:
     """Route left-edge halo gradients back to interior voxels.
 
-    Forward computes ``out[:halo] = f(x)``. Backward adds ``grad_halo`` to the
-    corresponding positions of ``grad_x``.
+    Forward computes ``out[:, :halo] = f(x)``. Backward adds ``grad_halo`` to
+    the corresponding positions of ``grad_x``.
 
     Args:
         grad_x: Gradient tensor for the unpadded local input, mutated in place.
         grad_halo: Gradient tensor for the left halo slice.
         padding_mode: Padding mode used in the forward pass.
     """
-    halo = grad_halo.shape[0]
+    halo = grad_halo.shape[1]
     if padding_mode == "zeros":
         pass  # edge halo was a constant, no grad flows to x
     elif padding_mode == "replicate":
-        grad_x[0] += grad_halo.sum(dim=0)
+        grad_x[:, 0] += grad_halo.sum(dim=1)
     elif padding_mode == "reflect":
-        # out[:halo] = x[1:halo+1].flip(0) → grad_x[1:halo+1] += grad_halo.flip(0)
-        grad_x[1 : halo + 1] += grad_halo.flip(0)
+        # out[:, :halo] = x[:, 1:halo+1].flip(1)
+        grad_x[:, 1 : halo + 1] += grad_halo.flip(1)
     else:  # pragma: no cover
         raise ValueError(f"unknown padding_mode {padding_mode!r}")
 
@@ -277,15 +276,15 @@ def _apply_left_edge_padding_backward(
 def _apply_right_edge_padding_backward(
     grad_x: torch.Tensor, grad_halo: torch.Tensor, padding_mode: str
 ) -> None:
-    halo = grad_halo.shape[0]
-    X_local = grad_x.shape[0]
+    halo = grad_halo.shape[1]
+    X_local = grad_x.shape[1]
     if padding_mode == "zeros":
         pass
     elif padding_mode == "replicate":
-        grad_x[-1] += grad_halo.sum(dim=0)
+        grad_x[:, -1] += grad_halo.sum(dim=1)
     elif padding_mode == "reflect":
-        # out[-halo:] = x[X_local - halo - 1 : X_local - 1].flip(0) → mirror flip back
-        grad_x[X_local - halo - 1 : X_local - 1] += grad_halo.flip(0)
+        # out[:, -halo:] = x[:, X_local-halo-1:X_local-1].flip(1)
+        grad_x[:, X_local - halo - 1 : X_local - 1] += grad_halo.flip(1)
     else:  # pragma: no cover
         raise ValueError(f"unknown padding_mode {padding_mode!r}")
 
@@ -305,7 +304,7 @@ def _halo_exchange_pg(
     """Exchange halo slices along the sharded X axis.
 
     Args:
-        x: Local channels-last tensor with shape ``(X_local, Y, Z, C)``.
+        x: Local channels-first tensor with shape ``(C, X_local, Y, Z)``.
         halo_left: Number of X slices required from the left neighbor.
         halo_right: Number of X slices required from the right neighbor.
         padding_mode: Edge padding mode for boundary ranks.
@@ -318,7 +317,7 @@ def _halo_exchange_pg(
     if halo_left == 0 and halo_right == 0:
         return x.contiguous() if not x.is_contiguous() else x
 
-    X_local, Y, Z, C = x.shape
+    C, X_local, Y, Z = x.shape
 
     # pg=None means "default / WORLD" when distributed is up; "no distributed"
     # when it isn't. Distinguishing them matters here — encoder hit the same
@@ -332,31 +331,40 @@ def _halo_exchange_pg(
     has_left = local_rank > 0
     has_right = local_rank < world_size - 1
 
-    out = x.new_empty((X_local + halo_left + halo_right, Y, Z, C))
-    out[halo_left : halo_left + X_local].copy_(x)
+    out = x.new_empty((C, X_local + halo_left + halo_right, Y, Z))
+    out[:, halo_left : halo_left + X_local].copy_(x)
 
     # Recv sizes match *my* halo widths; send sizes match the *peer's* halo
     # widths (same, by uniform-X_local). My send to the left fills their right
     # halo (halo_right); my send to the right fills their left halo (halo_left).
     send_bufs: list[torch.Tensor] = []
+    left_recv_buf: torch.Tensor | None = None
+    right_recv_buf: torch.Tensor | None = None
     reqs: list[Any] = []
 
     if has_left:
         if halo_left > 0:
-            reqs.append(dist.irecv(out[:halo_left], local_rank - 1, group=pg))
+            left_recv_buf = torch.empty((C, halo_left, Y, Z), dtype=x.dtype, device=x.device)
+            reqs.append(dist.irecv(left_recv_buf, local_rank - 1, group=pg))
         if halo_right > 0:
-            send_bufs.append(x[:halo_right].contiguous())
+            send_bufs.append(x[:, :halo_right].contiguous())
             reqs.append(dist.isend(send_bufs[-1], local_rank - 1, group=pg))
 
     if has_right:
         if halo_left > 0:
-            send_bufs.append(x[-halo_left:].contiguous())
+            send_bufs.append(x[:, -halo_left:].contiguous())
             reqs.append(dist.isend(send_bufs[-1], local_rank + 1, group=pg))
         if halo_right > 0:
-            reqs.append(dist.irecv(out[-halo_right:], local_rank + 1, group=pg))
+            right_recv_buf = torch.empty((C, halo_right, Y, Z), dtype=x.dtype, device=x.device)
+            reqs.append(dist.irecv(right_recv_buf, local_rank + 1, group=pg))
 
     for req in reqs:
         req.wait()
+
+    if left_recv_buf is not None:
+        out[:, :halo_left].copy_(left_recv_buf)
+    if right_recv_buf is not None:
+        out[:, -halo_right:].copy_(right_recv_buf)
 
     if halo_left > 0 and not has_left:
         _apply_left_edge_padding(out, x, halo_left, padding_mode)
@@ -376,7 +384,7 @@ def _halo_exchange(
     """Exchange halo slices using a mesh wrapper.
 
     Args:
-        x: Local channels-last tensor.
+        x: Local channels-first tensor.
         halo_left: Number of X slices required from the left neighbor.
         halo_right: Number of X slices required from the right neighbor.
         padding_mode: Edge padding mode for boundary ranks.
@@ -404,22 +412,22 @@ def _halo_exchange_backward_pg(
 
     Args:
         grad_halo: Gradient on the haloed tensor with shape
-            ``(X_local + halo_left + halo_right, Y, Z, C)``.
+            ``(C, X_local + halo_left + halo_right, Y, Z)``.
         halo_left: Number of left halo slices used in the forward pass.
         halo_right: Number of right halo slices used in the forward pass.
         padding_mode: Edge padding mode used in the forward pass.
         pg: Process group used for the original halo exchange.
 
     Returns:
-        Gradient tensor with shape ``(X_local, Y, Z, C)``.
+        Gradient tensor with shape ``(C, X_local, Y, Z)``.
     """
     if halo_left == 0 and halo_right == 0:
         return grad_halo.contiguous() if not grad_halo.is_contiguous() else grad_halo
 
-    X_padded, Y, Z, C = grad_halo.shape
+    C, X_padded, Y, Z = grad_halo.shape
     X_local = X_padded - halo_left - halo_right
 
-    grad_x = grad_halo[halo_left : halo_left + X_local].contiguous()
+    grad_x = grad_halo[:, halo_left : halo_left + X_local].contiguous()
 
     if dist.is_initialized():
         local_rank = dist.get_rank(pg)
@@ -439,21 +447,21 @@ def _halo_exchange_backward_pg(
     # left in forward, the left neighbor now sends halo_right back to me.
     if has_left:
         if halo_left > 0:
-            send_bufs.append(grad_halo[:halo_left].contiguous())
+            send_bufs.append(grad_halo[:, :halo_left].contiguous())
             reqs.append(dist.isend(send_bufs[-1], local_rank - 1, group=pg))
         if halo_right > 0:
             left_recv_buf = torch.empty(
-                (halo_right, Y, Z, C), dtype=grad_x.dtype, device=grad_x.device
+                (C, halo_right, Y, Z), dtype=grad_x.dtype, device=grad_x.device
             )
             reqs.append(dist.irecv(left_recv_buf, local_rank - 1, group=pg))
 
     if has_right:
         if halo_right > 0:
-            send_bufs.append(grad_halo[-halo_right:].contiguous())
+            send_bufs.append(grad_halo[:, -halo_right:].contiguous())
             reqs.append(dist.isend(send_bufs[-1], local_rank + 1, group=pg))
         if halo_left > 0:
             right_recv_buf = torch.empty(
-                (halo_left, Y, Z, C), dtype=grad_x.dtype, device=grad_x.device
+                (C, halo_left, Y, Z), dtype=grad_x.dtype, device=grad_x.device
             )
             reqs.append(dist.irecv(right_recv_buf, local_rank + 1, group=pg))
 
@@ -461,14 +469,14 @@ def _halo_exchange_backward_pg(
         req.wait()
 
     if left_recv_buf is not None:
-        grad_x[:halo_right] += left_recv_buf
+        grad_x[:, :halo_right] += left_recv_buf
     if right_recv_buf is not None:
-        grad_x[-halo_left:] += right_recv_buf
+        grad_x[:, -halo_left:] += right_recv_buf
 
     if halo_left > 0 and not has_left:
-        _apply_left_edge_padding_backward(grad_x, grad_halo[:halo_left], padding_mode)
+        _apply_left_edge_padding_backward(grad_x, grad_halo[:, :halo_left], padding_mode)
     if halo_right > 0 and not has_right:
-        _apply_right_edge_padding_backward(grad_x, grad_halo[-halo_right:], padding_mode)
+        _apply_right_edge_padding_backward(grad_x, grad_halo[:, -halo_right:], padding_mode)
 
     return grad_x
 
@@ -492,7 +500,7 @@ def _local_conv_on_halo(
     function handles only Y/Z padding and the convolution itself.
 
     Args:
-        x_halo: Channels-last tensor with X-axis halos included.
+        x_halo: Channels-first tensor with X-axis halos included.
         weight: Convolution weight tensor.
         bias: Optional bias tensor.
         stride: Per-axis convolution stride.
@@ -500,23 +508,22 @@ def _local_conv_on_halo(
         padding_mode: Padding mode for Y/Z padding.
 
     Returns:
-        Local channels-last convolution output.
+        Local channels-first convolution output.
     """
-    x_nchw = x_halo.unsqueeze(0).permute(0, 4, 1, 2, 3)
-    w_cl = weight.to(memory_format=torch.channels_last_3d)
+    x_ncdhw = x_halo.unsqueeze(0)
 
     P_y, P_z = padding[1], padding[2]
     if P_y == 0 and P_z == 0:
-        x_padded = x_nchw
+        x_padded = x_ncdhw
     else:
         pad_vals = [P_z, P_z, P_y, P_y, 0, 0]
         if padding_mode == "zeros":
-            x_padded = F.pad(x_nchw, pad_vals, mode="constant", value=0)
+            x_padded = F.pad(x_ncdhw, pad_vals, mode="constant", value=0)
         else:
-            x_padded = F.pad(x_nchw, pad_vals, mode=padding_mode)
+            x_padded = F.pad(x_ncdhw, pad_vals, mode=padding_mode)
 
-    out_nchw = F.conv3d(x_padded, w_cl, bias, stride=stride, padding=0)
-    return out_nchw.squeeze(0).permute(1, 2, 3, 0)
+    out_ncdhw = F.conv3d(x_padded, weight, bias, stride=stride, padding=0)
+    return out_ncdhw.squeeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +544,7 @@ def _conv3d_op(
     """Run the distributed convolution custom op forward pass.
 
     Args:
-        x: Local channels-last input tensor.
+        x: Local channels-first input tensor.
         weight: Convolution weight tensor.
         bias: Optional bias tensor.
         stride: Per-axis stride encoded as a list for the custom-op schema.
@@ -570,7 +577,7 @@ def _fake_conv3d_op(
     padding_mode: str,
     group_name: str,
 ):
-    X_local, Y, Z, C_in = x.shape
+    C_in, X_local, Y, Z = x.shape
     C_out, _, K_x, K_y, K_z = weight.shape
     halo_left = padding[0]
     halo_right = K_x - stride[0] - padding[0]
@@ -580,8 +587,8 @@ def _fake_conv3d_op(
     Y_out = (Y + 2 * padding[1] - K_y) // stride[1] + 1
     Z_out = (Z + 2 * padding[2] - K_z) // stride[2] + 1
 
-    out = x.new_empty((X_out, Y_out, Z_out, C_out))
-    x_halo = x.new_empty((X_padded, Y, Z, C_in))
+    out = x.new_empty((C_out, X_out, Y_out, Z_out))
+    x_halo = x.new_empty((C_in, X_padded, Y, Z))
     return out, x_halo
 
 
@@ -655,27 +662,26 @@ def _conv3d_backward(ctx, grad_out, _grad_x_halo_ignored):
     halo_left = ctx.halo_left
     halo_right = ctx.halo_right
 
-    # NCDHW view of x_halo (strides-only reinterpret) — serves both as the
-    # pre-Y/Z-pad input to the conv and as shape info for the pad backward.
-    x_nchw = x_halo.unsqueeze(0).permute(0, 4, 1, 2, 3)
+    # NCDHW view of x_halo — serves both as the pre-Y/Z-pad input to the conv
+    # and as shape info for the pad backward.
+    x_ncdhw = x_halo.unsqueeze(0)
 
     # Rebuild x_padded with Y/Z padding (no collectives here).
     P_y, P_z = padding[1], padding[2]
     if P_y > 0 or P_z > 0:
         pad_vals = [P_z, P_z, P_y, P_y, 0, 0]
         if padding_mode == "zeros":
-            x_padded = F.pad(x_nchw, pad_vals, mode="constant", value=0)
+            x_padded = F.pad(x_ncdhw, pad_vals, mode="constant", value=0)
         else:
-            x_padded = F.pad(x_nchw, pad_vals, mode=padding_mode)
+            x_padded = F.pad(x_ncdhw, pad_vals, mode=padding_mode)
     else:
-        x_padded = x_nchw
+        x_padded = x_ncdhw
 
-    # grad_out (channels-last) → NCDHW contiguous for convolution_backward.
-    grad_out_nchw = grad_out.unsqueeze(0).permute(0, 4, 1, 2, 3).contiguous()
+    grad_out_ncdhw = grad_out.unsqueeze(0).contiguous()
 
     C_out = weight.shape[0]
     grad_x_padded_nchw, grad_weight, grad_bias = torch.ops.aten.convolution_backward(
-        grad_out_nchw,
+        grad_out_ncdhw,
         x_padded,
         weight,
         [C_out] if has_bias else None,
@@ -691,10 +697,9 @@ def _conv3d_backward(ctx, grad_out, _grad_x_halo_ignored):
     # Native Y/Z pad backward — for reflect/replicate this dispatches to the
     # aten kernel that accumulates padded grads into the reflected/replicated
     # interior positions, instead of dropping them.
-    grad_x_halo_nchw = _pad_backward_yz(grad_x_padded_nchw, x_nchw, P_y, P_z, padding_mode)
+    grad_x_halo_ncdhw = _pad_backward_yz(grad_x_padded_nchw, x_ncdhw, P_y, P_z, padding_mode)
 
-    # NCDHW → channels-last.
-    grad_x_halo = grad_x_halo_nchw.squeeze(0).permute(1, 2, 3, 0).contiguous()
+    grad_x_halo = grad_x_halo_ncdhw.squeeze(0).contiguous()
 
     # Halo exchange backward: send halo grads back to source, accumulate
     # neighbor contributions, handle edge reflections/replications along X.
@@ -735,7 +740,7 @@ def conv3d(
     """Run 1D-sharded distributed 3D convolution with autograd.
 
     Args:
-        x: Channels-last input tensor with shape ``(X_local, Y, Z, C_in)``.
+        x: Channels-first input tensor with shape ``(C_in, X_local, Y, Z)``.
         weight: Weight tensor with shape ``(C_out, C_in, K_x, K_y, K_z)``.
         bias: Optional bias tensor with shape ``(C_out,)``.
         stride: Scalar or per-axis convolution stride.
@@ -745,8 +750,8 @@ def conv3d(
         mesh: Optional 1D ``DeviceMesh`` along the sharded X axis.
 
     Returns:
-        Channels-last output tensor with shape
-        ``(X_local / stride_x, Y_out, Z_out, C_out)``.
+        Channels-first output tensor with shape
+        ``(C_out, X_local / stride_x, Y_out, Z_out)``.
 
     Raises:
         TypeError: If scalar-or-tuple parameters have unsupported types.

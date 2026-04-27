@@ -172,23 +172,23 @@ def _local_scatter(
 ):
     C = recv_feat.shape[1]
     out = torch.zeros(
-        (X_local * Y * Z, C),
+        (C, X_local * Y * Z),
         dtype=recv_feat.dtype,
         device=recv_feat.device,
     )
     lin = ((recv_xyz[:, 0] * Y) + recv_xyz[:, 1]) * Z + recv_xyz[:, 2]
-    out.index_add_(0, lin, recv_feat)
-    return out.view(X_local, Y, Z, C)
+    out.index_add_(1, lin, recv_feat.transpose(0, 1))
+    return out.view(C, X_local, Y, Z)
 
 
 def _local_gather_grad(
     grad_out: torch.Tensor,
     recv_xyz: torch.Tensor,
 ):
-    X_local, Y, Z, C = grad_out.shape
-    grad_flat = grad_out.contiguous().view(X_local * Y * Z, C)
+    C, X_local, Y, Z = grad_out.shape
+    grad_flat = grad_out.contiguous().view(C, X_local * Y * Z)
     lin = ((recv_xyz[:, 0] * Y) + recv_xyz[:, 1]) * Z + recv_xyz[:, 2]
-    return grad_flat.index_select(0, lin)
+    return grad_flat.index_select(1, lin).transpose(0, 1)
 
 
 # the op returns the voxel grid plus the four tensors backward needs
@@ -235,7 +235,7 @@ def _fake(
     N, C = feat.shape
     world_size = dist.get_world_size(resolve_group(group_name))
 
-    voxel = feat.new_empty((X_local, Y, Z, C))
+    voxel = feat.new_empty((C, X_local, Y, Z))
     unsort_perm = torch.empty((N,), dtype=torch.int64, device=feat.device)
     send_counts = torch.empty((world_size,), dtype=torch.int64, device=feat.device)
     recv_counts = torch.empty((world_size,), dtype=torch.int64, device=feat.device)
@@ -261,7 +261,7 @@ def _setup_context(ctx, inputs, output):
 def _backward(ctx, grad_voxel, *_non_diff_grads):
     unsort_perm, send_counts, recv_counts, recv_xyz = ctx.saved_tensors
     pg = resolve_group(ctx.group_name)
-    C = grad_voxel.shape[-1]
+    C = grad_voxel.shape[0]
 
     grad_recv_feat = _local_gather_grad(grad_voxel, recv_xyz)
 
@@ -310,7 +310,7 @@ def encoder_scatter_to_voxel(
             used.
 
     Returns:
-        Local voxel grid tensor with shape ``(X_local, Y, Z, C)``.
+        Local voxel grid tensor with shape ``(C, X_local, Y, Z)``.
 
     Raises:
         RuntimeError: If torch.distributed is not initialized.
