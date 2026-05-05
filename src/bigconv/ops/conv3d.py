@@ -315,7 +315,10 @@ def _halo_exchange_pg(
         Tensor with left and right halos included along X.
     """
     if halo_left == 0 and halo_right == 0:
-        return x.contiguous() if not x.is_contiguous() else x
+        # Custom op outputs cannot alias inputs. The no-halo path is used by
+        # 1x1x1 convolutions, so return a distinct tensor even when x is already
+        # contiguous.
+        return x.contiguous().clone()
 
     C, X_local, Y, Z = x.shape
 
